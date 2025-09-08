@@ -1,0 +1,16 @@
+[package]
+name = "copy-upload"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+copypasta = "0.10"
+reqwest = { version = "0.12", features = ["stream"] }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+base64 = "0.22"
+mime_guess = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+magic = "0.16.2"
+human-units = {version = "0.5.3", features = ["derive", "iec-units"]}

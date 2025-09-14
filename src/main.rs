@@ -10,15 +10,49 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::Debug;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:8000";
 const DEFAULT_MAX_FILE_SIZE: u64 = 4096;
 
 #[derive(Parser)]
-#[command(name = "bepasty-paste")]
-#[command(about = "Upload files or clipboard content to bepasty")]
+#[command(
+    name = "bpaste",
+    about = "Upload files or clipboard content to bepasty",
+    long_about = r#"Upload files or clipboard content to a bepasty server.
+
+Configuration precedence (highest first):
+  1. Command-line options
+  2. Environment variables
+  3. Config file (if found)
+  4. Built-in defaults
+
+Environment variables:
+  BPASTE_API_BASE_URL       Override base URL
+  BPASTE_API_KEY        API key (required unless provided elsewhere)
+  BPASTE_MAX_FILE_SIZE  Maximum file size (e.g. 10M, 512K)
+  BPASTE_CONFIG_PATH    Explicit path to config file
+
+Config file discovery (if BPASTE_CONFIG_PATH and --config-path absent):
+  $XDG_CONFIG_HOME/bpaste/bpaste.conf (fallback: $HOME/.config/...)
+  Each directory in $XDG_CONFIG_DIRS (fallback: /etc/xdg) is checked for bpaste/bpaste.conf
+
+Config file format: simple key=value per line, lines starting with # are comments.
+
+Supported keys:
+  base_url      = https://bepasty.example.org
+  api_key       = mysecretapikey
+  max_file_size = 5M
+
+Example (~/.config/bpaste/bpaste.conf):
+  # Bpaste uploader configuration
+  base_url = https://bepasty.example.org
+  api_key = abcdef123456
+  max_file_size = 10M
+
+Units for max_file_size follow human_units crate (K, M, G etc)."#
+)]
 struct Args {
     /// File to upload, or '-' for stdin
     file: Option<String>,
@@ -51,7 +85,7 @@ impl Config {
         let explicit_config_path = args
             .config_path
             .clone()
-            .or_else(|| env::var("BEPASTY_CONFIG_PATH").ok());
+            .or_else(|| env::var("BPASTE_CONFIG_PATH").ok());
 
         let discovered_path = if explicit_config_path.is_none() {
             discover_config_file()
@@ -93,8 +127,8 @@ impl Config {
             }
         };
 
-        let base_url = get_str(&args.base_url, "BEPASTY_BASE_URL", "base_url", DEFAULT_BASE_URL);
-        let api_key  = get_str(&args.api_key,  "BEPASTY_API_KEY",  "api_key",  "");
+        let base_url = get_str(&args.base_url, "BPASTE_API_BASE_URL", "base_url", DEFAULT_BASE_URL);
+        let api_key  = get_str(&args.api_key,  "BPASTE_API_KEY",  "api_key",  "");
 
         if api_key.is_empty() {
             return Err(anyhow!("API key not provided (CLI/env/config); cannot proceed"));
@@ -104,7 +138,7 @@ impl Config {
             return Err(anyhow!("Base URL must start with http:// or https://"));
         }
 
-        let max_file_size = get_u64(&args.max_file_size, "BEPASTY_MAX_FILE_SIZE", "max_file_size", DEFAULT_MAX_FILE_SIZE);
+        let max_file_size = get_u64(&args.max_file_size, "BPASTE_MAX_FILE_SIZE", "max_file_size", DEFAULT_MAX_FILE_SIZE);
         if max_file_size == 0 {
             return Err(anyhow!("Maximum file size must be greater than 0"));
         }
@@ -154,7 +188,6 @@ impl Debug for File {
 struct FileContent {
     content: File,
     filename: String,
-    mime_type: Option<String>,
 }
 
 fn read_input(source: &InputSource) -> Result<FileContent> {
@@ -172,7 +205,7 @@ fn read_input(source: &InputSource) -> Result<FileContent> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            Ok(FileContent { content: File::Path(path.clone()), filename: filename, mime_type: None })
+            Ok(FileContent { content: File::Path(path.clone()), filename })
         }
         InputSource::Stdin => {
             let mut content = Vec::new();
@@ -182,7 +215,7 @@ fn read_input(source: &InputSource) -> Result<FileContent> {
             }
             let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
             let filename = format!("stdin-{}", timestamp);
-            Ok(FileContent { content: File::Bytes(content), filename: filename, mime_type: None })
+            Ok(FileContent { content: File::Bytes(content), filename })
         }
         InputSource::Clipboard => {
             let mut ctx = ClipboardContext::new()
@@ -196,19 +229,17 @@ fn read_input(source: &InputSource) -> Result<FileContent> {
             let content_bytes = content.into_bytes();
             let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
             let filename = format!("clipboard-{}", timestamp);
-            Ok(FileContent { content: File::Bytes(content_bytes), filename: filename, mime_type: None })
+            Ok(FileContent { content: File::Bytes(content_bytes), filename })
         }
     }
 }
 
 struct FileType {
     mime_type: String,
-    extension: Option<String>,
 }
 
 fn detect_content_type(file: &FileContent) -> Result<FileType> {
     // Use magic to detect MIME type
-    // let cookie = Cookie::open(magic::cookie::Flags::ERROR | magic::cookie::Flags::MIME_TYPE | magic::cookie::Flags::EXTENSION)?;
     let cookie = Cookie::open(magic::cookie::Flags::ERROR | magic::cookie::Flags::EXTENSION)?;
     let database = &Default::default();
     let cookie = cookie.load(database).map_err(|_| anyhow!("Failed to load magic database"))?;
@@ -232,7 +263,6 @@ fn detect_content_type(file: &FileContent) -> Result<FileType> {
 
     return Ok(FileType {
         mime_type: mime_type.to_string(),
-        extension: ".txt".to_string().into(),
     });
     
 }
@@ -350,13 +380,13 @@ fn discover_config_file() -> Option<String> {
     let mut candidates = Vec::new();
 
     if let Some(base) = xdg_config_home {
-        candidates.push(format!("{}/bepasty-upload/bepasty-upload.conf", base));
+        candidates.push(format!("{}/bpaste/bpaste.conf", base));
     }
 
     let xdg_config_dirs = env::var("XDG_CONFIG_DIRS").ok().unwrap_or_else(|| "/etc/xdg".to_string());
     for dir in xdg_config_dirs.split(':') {
         if dir.is_empty() { continue; }
-        candidates.push(format!("{}/bepasty-upload/bepasty-upload.conf", dir));
+        candidates.push(format!("{}/bpaste/bpaste.conf", dir));
     }
 
     for p in candidates {
@@ -381,20 +411,20 @@ async fn main() -> Result<()> {
     // println!("DEBUG: read: \n{:?}", file_content.content);
     detect_content_type(&file_content)?;
     
-    // match upload_to_bepasty(&config, &file_content).await {
-    //     Ok(url) => {
-    //         if let Err(e) = copy_to_clipboard(&url) {
-    //             eprintln!("Warning: Failed to copy to clipboard: {}", e);
-    //             println!("Upload successful! URL: {}", url);
-    //         } else {
-    //             println!("Upload successful! URL copied to clipboard: {}", url);
-    //         }
-    //     }
-    //     Err(e) => {
-    //         eprintln!("Upload failed: {}", e);
-    //         std::process::exit(1);
-    //     }
-    // }
+    match upload_to_bepasty(&config, &file_content).await {
+        Ok(url) => {
+            if let Err(e) = copy_to_clipboard(&url) {
+                eprintln!("Warning: Failed to copy to clipboard: {}", e);
+                println!("Upload successful! URL: {}", url);
+            } else {
+                println!("Upload successful! URL copied to clipboard: {}", url);
+            }
+        }
+        Err(e) => {
+            eprintln!("Upload failed: {}", e);
+            std::process::exit(1);
+        }
+    }
     
     Ok(())
 }
